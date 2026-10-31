@@ -163,20 +163,51 @@ class TestOnboardingSetupEndpoint:
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
 
+    def _get(self, path: str) -> dict:
+        with urllib.request.urlopen(BASE + path, timeout=10) as r:
+            return json.loads(r.read())
+
+    @pytest.fixture(autouse=True)
+    def _restore_server_onboarding_files(self):
+        """Put back the config.yaml, .env and onboarding flag that setup overwrites.
+
+        The test server is a separate process, so a ``mock.patch`` in this
+        process cannot stop ``apply_onboarding_setup`` there. A loopback setup
+        request really writes ``model: {provider: anthropic, default:
+        claude-sonnet-4.6}`` to the shared test-state ``config.yaml`` (which is
+        also this process's ``HERMES_HOME`` config) plus the key to ``.env``.
+        Left behind, every later in-process Agent call resolves ``anthropic`` as
+        the main provider: the real ``ContextCompressor`` then tries that
+        provider for its summary, fails, and emits no summary carrier
+        (test_quiet_delegation_re_g2::test_real_compressor_round2_context_cuts_at_tail_copy).
+        """
+        system = self._get("/api/onboarding/status")["system"]
+        paths = [pathlib.Path(system["config_path"]), pathlib.Path(system["env_path"])]
+        saved = {path: path.read_bytes() if path.exists() else None for path in paths}
+        saved_completed = bool(self._get("/api/settings").get("onboarding_completed"))
+        yield
+        for path, data in saved.items():
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(data)
+        self._post("/api/settings", {"onboarding_completed": saved_completed})
+        # GET /api/personalities calls reload_config(), so the server drops the
+        # provider state it cached from the setup write.
+        self._get("/api/personalities")
+
     def test_loopback_request_allowed(self):
         """
         Requests from 127.0.0.1 (which is what the test server sees) should
         pass the IP check. We confirm no 403 is returned.
         """
         # The test server runs on 127.0.0.1:{TEST_PORT} so client_address[0] is 127.0.0.1.
-        # A valid setup payload with a mock provider should not be rejected for IP reasons.
-        # We patch apply_onboarding_setup to avoid actually writing any config.
-        import unittest.mock
-        with unittest.mock.patch("api.onboarding.apply_onboarding_setup", return_value={"ok": True}):
-            status, body = self._post(
-                "/api/onboarding/setup",
-                {"provider": "anthropic", "model": "claude-sonnet-4.6", "api_key": "test-key"},
-            )
+        # A valid setup payload should not be rejected for IP reasons. The server
+        # applies it for real; _restore_server_onboarding_files undoes the writes.
+        status, body = self._post(
+            "/api/onboarding/setup",
+            {"provider": "anthropic", "model": "claude-sonnet-4.6", "api_key": "test-key"},
+        )
         # Should not be 403 (IP blocked). May be 200 or another error from apply logic.
         assert status != 403, f"Got 403 — IP check incorrectly blocked loopback. Body: {body}"
 
@@ -185,11 +216,9 @@ class TestOnboardingSetupEndpoint:
         Simulated reverse proxy: raw TCP is 127.0.0.1 but X-Forwarded-For is also
         127.0.0.1. Should be allowed.
         """
-        import unittest.mock
-        with unittest.mock.patch("api.onboarding.apply_onboarding_setup", return_value={"ok": True}):
-            status, body = self._post(
-                "/api/onboarding/setup",
-                {"provider": "anthropic", "model": "claude-sonnet-4.6", "api_key": "test-key"},
-                headers={"X-Forwarded-For": "127.0.0.1"},
-            )
+        status, body = self._post(
+            "/api/onboarding/setup",
+            {"provider": "anthropic", "model": "claude-sonnet-4.6", "api_key": "test-key"},
+            headers={"X-Forwarded-For": "127.0.0.1"},
+        )
         assert status != 403, f"Got 403 with XFF=127.0.0.1. Body: {body}"
