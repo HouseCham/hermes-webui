@@ -19,6 +19,8 @@ from typing import Any
 from api.config import (
     AGENT_INSTANCES,
     CANCEL_FLAGS,
+    CODE_EXTS,
+    MD_EXTS,
     MAX_UPLOAD_BYTES,
     STREAM_GOAL_RELATED,
     STREAMS,
@@ -1144,7 +1146,10 @@ def _gateway_text_attachment_content(attachments, workspace: str, *, profile=Non
             continue
         mime = str(attachment.get("mime") or "").split(";", 1)[0].strip().lower()
         path_value = str(attachment.get("path") or "").strip()
-        if not path_value or not (mime.startswith("text/") or Path(path_value).suffix.lower() in {".md", ".markdown", ".mdown", ".txt"}):
+        if not path_value:
+            continue
+        extension = Path(path_value).suffix.lower()
+        if not mime.startswith("text/") and extension not in CODE_EXTS | MD_EXTS:
             continue
         try:
             path = Path(path_value).expanduser().resolve(strict=True)

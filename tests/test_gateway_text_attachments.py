@@ -40,6 +40,17 @@ def test_runs_api_payload_contains_text_not_local_attachment_path(tmp_path, monk
     assert str(attachment) not in captured["input"]
 
 
+def test_gateway_message_inlines_code_files_using_known_text_extensions(tmp_path):
+    source = tmp_path / "script.py"
+    source.write_text("print('hello')", encoding="utf-8")
+
+    result = _build_gateway_attachment_message(
+        "review", [{"path": str(source), "name": source.name, "mime": "application/octet-stream"}], str(tmp_path)
+    )
+
+    assert "print('hello')" in result
+
+
 def test_gateway_message_inlines_large_markdown_attachment(tmp_path):
     pasted = "# pasted text\n" + ("some long content\n" * 300)
     attachment = tmp_path / "pasted-text-2026-10-31_00-14-51-583.md"
