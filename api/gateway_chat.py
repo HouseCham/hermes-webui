@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import socket
+import stat
 import threading
 from pathlib import Path
 import time
@@ -18,6 +19,7 @@ from typing import Any
 from api.config import (
     AGENT_INSTANCES,
     CANCEL_FLAGS,
+    MAX_UPLOAD_BYTES,
     STREAM_GOAL_RELATED,
     STREAMS,
     STREAMS_LOCK,
@@ -1120,6 +1122,81 @@ def _gateway_run_headers(session_id, api_key) -> dict:
     return headers
 
 
+def _gateway_text_attachment_content(attachments, workspace: str, *, profile=None) -> list[dict[str, str]]:
+    """Read bounded plain-text uploads into the Gateway request, never as host paths."""
+    if not attachments:
+        return []
+
+    try:
+        workspace_root = Path(workspace).expanduser().resolve()
+        from api.upload import _attachment_root
+        from api.workspace import open_anchored_fd
+
+        allowed_roots = (workspace_root, _attachment_root())
+    except Exception:
+        logger.debug("Unable to resolve Gateway attachment roots", exc_info=True)
+        return []
+
+    content_parts: list[dict[str, str]] = []
+    total_bytes = 0
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        mime = str(attachment.get("mime") or "").split(";", 1)[0].strip().lower()
+        path_value = str(attachment.get("path") or "").strip()
+        if not path_value or not (mime.startswith("text/") or Path(path_value).suffix.lower() in {".md", ".markdown", ".mdown", ".txt"}):
+            continue
+        try:
+            path = Path(path_value).expanduser().resolve(strict=True)
+            matched_root = next((root for root in allowed_roots if path.is_relative_to(root)), None)
+            if matched_root is None:
+                continue
+            descriptor = open_anchored_fd(matched_root, path, want_dir=False)
+            try:
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    continue
+                remaining = MAX_UPLOAD_BYTES - total_bytes
+                if file_stat.st_size <= 0 or file_stat.st_size > remaining:
+                    continue
+                with os.fdopen(descriptor, "rb", closefd=False) as source:
+                    raw = source.read(remaining + 1)
+                if len(raw) != file_stat.st_size or len(raw) > remaining:
+                    continue
+            finally:
+                os.close(descriptor)
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError, RuntimeError, ValueError):
+            continue
+
+        total_bytes += len(raw)
+        name = Path(str(attachment.get("name") or path.name)).name
+        content_parts.append({"type": "text", "text": f"[Attached text file: {name}]\n{text}"})
+    return content_parts
+
+
+def _build_gateway_attachment_message(msg_text: str, attachments, workspace: str, *, cfg=None, active_provider: str = "", active_model: str = "", profile=None):
+    """Build a Gateway-safe message with image parts and inline text file content."""
+    message: Any = str(msg_text or "")
+    if attachments:
+        from api.streaming import _build_native_multimodal_message
+
+        message = _build_native_multimodal_message(
+            "", str(msg_text or ""), attachments, workspace,
+            cfg=cfg, active_provider=active_provider, active_model=active_model,
+            requested_provider=active_provider, profile=profile,
+        )
+    text_parts = _gateway_text_attachment_content(attachments, workspace, profile=profile)
+    if text_parts:
+        if isinstance(message, list):
+            message.extend(text_parts)
+        else:
+            body = str(message or "")
+            appended = "\n\n".join(part["text"] for part in text_parts)
+            message = f"{body}\n\n{appended}" if body else appended
+    return message
+
+
 def _run_gateway_runs_api_streaming(
     session_id, msg_text, model, workspace, stream_id,
     base_url, api_key, prefill_messages, body_extras,
@@ -1136,9 +1213,11 @@ def _run_gateway_runs_api_streaming(
         message_content: Any = str(msg_text or "")
         if attachments:
             try:
-                from api.streaming import _build_native_multimodal_message
-
-                message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=active_provider, active_model=(model or ""), requested_provider=active_provider, profile=getattr(session, "profile", None))
+                message_content = _build_gateway_attachment_message(
+                    str(msg_text or ""), attachments, str(workspace), cfg=cfg,
+                    active_provider=active_provider, active_model=(model or ""),
+                    profile=getattr(session, "profile", None),
+                )
             except Exception:
                 logger.debug("Failed to build runs-API multimodal attachment payload", exc_info=True)
                 message_content = str(msg_text or "")
@@ -3250,9 +3329,11 @@ def _run_gateway_chat_streaming(
             message_content: Any = str(msg_text or "")
             if attachments:
                 try:
-                    from api.streaming import _build_native_multimodal_message
-
-                    message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=(model_provider or ""), active_model=(model or ""), requested_provider=(model_provider or ""), profile=getattr(s, "profile", None))
+                    message_content = _build_gateway_attachment_message(
+                        str(msg_text or ""), attachments, str(workspace), cfg=cfg,
+                        active_provider=(model_provider or ""), active_model=(model or ""),
+                        profile=getattr(s, "profile", None),
+                    )
                 except Exception:
                     logger.debug("Failed to build gateway multimodal attachment payload", exc_info=True)
                     message_content = str(msg_text or "")
